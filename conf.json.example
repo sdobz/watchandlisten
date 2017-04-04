@@ -1,0 +1,12 @@
+{
+  "log": "out.log",
+  "addr": "0.0.0.0:8080",
+  "hooks": [
+    {
+      "webhook_url": "/webhook",
+      "ref": "refs/heads/master",
+      "events": ["push"],
+      "command": "cd /opt/myapp && git pull"
+    }
+  ]
+}
