@@ -7,11 +7,11 @@ import (
 	"log"
 	"net/http"
 	"io/ioutil"
-	"errors"
 	"os/exec"
 	"bytes"
 	"os"
 	"io"
+	"errors"
 )
 
 type WALConfigHook struct {
@@ -21,10 +21,71 @@ type WALConfigHook struct {
 	Ref         string
 }
 
+func (hook *WALConfigHook) appliesTo(r *http.Request) bool {
+	events, ok := r.Header["X-Github-Event"];
+	if  !ok || len(events) != 1 {
+		log.Print("No X-Github-Event header found")
+		return false
+	}
+
+	event := events[0]
+	found := false
+	for _, e := range hook.Events {
+		found = found || event == e
+	}
+	if !found {
+		log.Printf("%s not interested in %s", r.URL.Path, event)
+		return false
+	}
+
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+
+	var payload WebhookPayload
+	err := decoder.Decode(&payload)
+	if err != nil {
+		log.Print(err)
+		return false
+	}
+
+	if payload.Ref != hook.Ref {
+		log.Printf("Ignoring ref: %s", payload.Ref)
+		return false
+	}
+
+	return true
+}
+
+func (hook *WALConfigHook) run() error {
+	cmd := exec.Command("bash", "-c", hook.Command)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	log.Print("> ", hook.Command)
+	if err != nil {
+		log.Print(err)
+	}
+	log.Print(out.String())
+	return nil
+}
+
 type WALConfig struct {
 	Log   string
 	Addr  string
+	RunWebhook string `json:""`
 	Hooks []WALConfigHook
+}
+
+func (config *WALConfig) findHook(path string) (*WALConfigHook, error) {
+	for _, hook := range config.Hooks {
+		if hook.Webhook_url != path {
+			continue
+		}
+		return &hook, nil
+	}
+	return nil, errors.New("Hook not found")
 }
 
 type WebhookPayload struct {
@@ -43,7 +104,7 @@ type Event struct {
 func getHandler(config *WALConfig) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		log.Printf("%s", path)
+		log.Printf("%s %s", r.Method, path)
 
 		if path == "/" {
 			logf, err := os.OpenFile(config.Log, os.O_RDONLY, 0640)
@@ -59,62 +120,21 @@ func getHandler(config *WALConfig) func(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 		} else if r.Method == "POST" {
-			var thisHook WALConfigHook
+			hook, err := config.findHook(path)
 
-			for _, hook := range config.Hooks {
-				if hook.Webhook_url != path {
-					continue
-				}
-				thisHook = hook
-			}
-
-			if &thisHook == nil {
-				log.Printf("POST to unknown hook: %s", path)
+			if err != nil {
+				log.Print(err.Error())
 				errorHandler(w, r, http.StatusNotFound)
 				return
 			}
 
-			events, ok := r.Header["X-Github-Event"];
-			if  !ok || len(events) != 1 {
-				log.Print("No X-Github-Event header found")
+			if !hook.appliesTo(r) {
 				return
 			}
 
-			event := events[0]
-			found := false
-			for _, e := range thisHook.Events {
-				found = found || event == e
-			}
-			if !found {
-				log.Printf("%s not interested in %s", path, event)
-				return
-			}
-
-			defer r.Body.Close()
-			decoder := json.NewDecoder(r.Body)
-
-			var payload WebhookPayload
-			err := decoder.Decode(&payload)
-			if err != nil {
-				log.Print(err)
-				return
-			}
-
-			if payload.Ref != thisHook.Ref {
-				log.Printf("Ignoring ref: %s", payload.Ref)
-			}
-
-			cmd := exec.Command("bash", "-c", thisHook.Command)
-
-			var out bytes.Buffer
-			cmd.Stdout = &out
-			cmd.Stderr = &out
-			err = cmd.Run()
-			log.Print("> ", thisHook.Command)
-			if err != nil {
+			if err = hook.run(); err != nil {
 				log.Print(err)
 			}
-			log.Print(out.String())
 		} else {
 			errorHandler(w, r, http.StatusNotFound)
 		}
@@ -129,23 +149,45 @@ func errorHandler(w http.ResponseWriter, r *http.Request, status int) {
 }
 
 func getConfig() (*WALConfig, error) {
+	testMode := flag.Bool("test", false, "Whether to test configuration")
+	configPath := flag.String("conf", "/etc/watchandlisten/conf.json", "Configuration location")
+	runWebhook := flag.String("run", "", "Run specified webhook and exit")
 	flag.Parse()
-	if flag.NArg() != 1 {
-		return nil, errors.New("Usage: watchandlisten <conf.json>")
-	}
 
-	configPath := flag.Arg(0)
-
-	raw, err := ioutil.ReadFile(configPath)
+	raw, err := ioutil.ReadFile(*configPath)
 	if err != nil {
+		if *testMode {
+			fmt.Print("Error loading config:\n")
+			fmt.Print(err, "\n")
+			os.Exit(1)
+		}
 		return nil, err
 	}
 
 	var config WALConfig
 	err = json.Unmarshal(raw, &config)
 	if err != nil {
+		if *testMode {
+			fmt.Print("Error parsing config:\n")
+			fmt.Print(err, "\n")
+			os.Exit(1)
+		}
 		return nil, err
 	}
+
+	if *testMode {
+		cmd := exec.Command("test", "-w", config.Log)
+
+		err = cmd.Run()
+		if err != nil {
+			fmt.Print("Cannot write log file")
+			os.Exit(1)
+		}
+		fmt.Print("OK\n")
+		os.Exit(0)
+	}
+
+	config.RunWebhook = *runWebhook
 
 	return &config, nil
 }
@@ -154,6 +196,19 @@ func main() {
 	conf, err := getConfig()
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if conf.RunWebhook != "" {
+		hook, err := conf.findHook(conf.RunWebhook)
+		if err != nil {
+			fmt.Print(err)
+			os.Exit(1)
+		}
+		if err = hook.run(); err != nil {
+			fmt.Print(err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 
 	logf, err := os.OpenFile(conf.Log, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0640)
