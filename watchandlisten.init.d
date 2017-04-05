@@ -1,20 +1,33 @@
 #!/bin/bash
 
-PIDFILE=/var/run/watchandlisten.pid
 CMD="/opt/watchandlisten/watchandlisten"
-USER="apache"
-GROUP="apache"
+PIDFILE="/var/run/watchandlisten.pid"
+USER="ec2-user"
 
 . /etc/init.d/functions
 
 start() {
   sudo -u ${USER} ${CMD} -test
-  daemon --pidfile="${PIDFILE}" --user=${USER} ${CMD}
+  if [ -s ${PIDFILE} ]; then
+    RETVAL=1
+    echo -n "Already running" && warning
+    echo
+  else
+    sudo -u ${USER} nohup ${CMD} 0<&- &>/dev/null &
+    RETVAL=$?
+    PID=$!
+    [ $RETVAL -eq 0 ] && success || failure
+    echo
+    echo $PID > ${PIDFILE}
+  fi
 }
 
 stop() {
-  if [ -f ${PIDFILE} ]; then
-    kill `cat ${PIDFILE}`
+  if [ -s ${PIDFILE} ]; then
+    if kill -0 `cat ${PIDFILE}` 2>/dev/null; then
+      kill `cat ${PIDFILE}` && success || failure
+      echo
+    fi
     rm ${PIDFILE}
   fi
 }

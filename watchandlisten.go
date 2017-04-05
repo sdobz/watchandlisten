@@ -180,7 +180,7 @@ func getConfig() (*WALConfig, error) {
 
 		err = cmd.Run()
 		if err != nil {
-			fmt.Print("Cannot write log file")
+			fmt.Print("Cannot write log file\n")
 			os.Exit(1)
 		}
 		fmt.Print("OK\n")
