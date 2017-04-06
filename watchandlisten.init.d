@@ -1,4 +1,5 @@
 #!/bin/bash
+# chkconfig: - 99 10
 
 CMD="/opt/watchandlisten/watchandlisten"
 PIDFILE="/var/run/watchandlisten.pid"
